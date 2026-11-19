@@ -52,6 +52,34 @@ class PerformancePolicy(unittest.TestCase):
         self.assertEqual(len(result), len(set(t.split('=')[0] for t in result)))
         self.assertIn('sweetfb_fixedtimer=0', boot.make_args(source, 0))
 
+    def test_fg_gen4_decode_matches_linux(self):
+        # Mirror pollCepheus integer math against Linux fg-util.c formulas.
+        def percent(raw):
+            return 100 if raw == 255 else 0 if raw == 0 else ((raw - 1) * 98 + 126) // 253 + 1
+        def linux(raw):
+            if raw == 255:
+                return 100
+            if raw == 0:
+                return 0
+            a, b = (raw - 1) * 98, 253
+            return (a + b // 2) // b + 1
+        for raw in range(256):
+            self.assertEqual(percent(raw), linux(raw))
+            self.assertLessEqual(percent(raw), 100)
+        self.assertEqual(percent(1), 1)
+        self.assertEqual(percent(254), 99)
+        self.assertEqual(0x8000 * 122070 // 1000000, 3999)  # ~4.0 V, truncated
+        self.assertEqual(-((-1024) * 488281) // 1000000, 499)  # charging ~500 mA
+
+    def test_battery_spmi_allows_only_battery_blocks(self):
+        source = ('\tif (!sp_ready || !out || sid != 0 || addr > 0xffffu ||\n'
+                  '\t    (peripheral != 0x10 && peripheral != 0x11 && peripheral != 0x12 &&\n'
+                  '\t    peripheral != 0x13 && peripheral != 0x48)) {')
+        result = perf.transform(perf.SPMI, source)
+        self.assertIn('sid == 2 && (peripheral == 0x10', result)
+        self.assertIn('peripheral == 0x40 || peripheral == 0x41', result)
+        self.assertNotIn('0x0c', result)  # never PON/GPIO key blocks
+
     def test_rejects_changed_source(self):
         with self.assertRaises(ValueError):
             perf.transform(perf.FB, 'unrelated source')
