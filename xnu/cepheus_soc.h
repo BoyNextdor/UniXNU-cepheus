@@ -31,6 +31,26 @@ static unsigned cepheus_osm_same_voltage(const uint32_t *freq, const uint32_t *v
 	}
 	return best;
 }
+/* Performance mode: highest multi-core LUT row at or below cap_khz, like
+ * qcom-cpufreq-hw writing a PERF_STATE index; OSM firmware owns the voltage.
+ * Never lower than current. Returns current on invalid/nonascending LUT.
+ */
+static unsigned cepheus_osm_capped(const uint32_t *freq, const uint32_t *volt,
+    unsigned count, unsigned current, uint32_t cap_khz)
+{
+	if (current >= count || count > CEPHEUS_OSM_ROWS || !count) { return current; }
+	unsigned best = current;
+	uint32_t previous = 0;
+	for (unsigned i = 0; i < count; ++i) {
+		uint32_t khz = cepheus_osm_khz(freq[i]);
+		if (freq[i] == 0xffffffffu || volt[i] == 0xffffffffu || (i && khz < previous)) { return current; }
+		if (i && khz == previous) { break; }
+		previous = khz;
+		if ((volt[i] & 0xfffu) != 0 && cepheus_osm_core_count(freq[i]) != 1 &&
+		    khz <= cap_khz && khz > cepheus_osm_khz(freq[best])) { best = i; }
+	}
+	return best;
+}
 static int cepheus_gpu_clock_on(uint32_t cbcr, int hwcg)
 {
 	if (cbcr == 0xffffffffu) { return 0; }
