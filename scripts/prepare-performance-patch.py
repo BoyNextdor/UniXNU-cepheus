@@ -91,17 +91,27 @@ def transform(path, text):
         # permanently-down event or read it in the performance control.
         # sweetvolup=PPID selects the board's volume-up PMIC GPIO peripheral
         # (PPID = SID << 8 | GPIO base >> 8, read-only like the reference).
-        text = replace(text, 'static bool keys_started;', 'static bool keys_started;\nstatic int keys_pon_only;\nstatic int keys_volup_ppid;')
+        # Polling it from boot coincided with the ST-FTS self-sense
+        # calibration failing on every test boot (43 05 30/31, then a silent
+        # touch IC); without it touch came up. Start reading it only after
+        # sweetvolupdelay seconds (default 150), past touch bring-up.
+        text = replace(text, 'static bool keys_started;', 'static bool keys_started;\nstatic int keys_pon_only;\nstatic int keys_volup_ppid;\nstatic uint64_t keys_volup_after;')
+        text = replace(text, '\t\tbool gok = keys_read(keys_gpio_apid, KEYS_GPIO_RT, &gpio);',
+                       '\t\tuint16_t gapid = mach_absolute_time() >= keys_volup_after ? keys_gpio_apid : KEYS_NO_APID;\n'
+                       '\t\tbool gok = keys_read(gapid, KEYS_GPIO_RT, &gpio);')
         text = replace(text, '\tkeys_gpio_apid = keys_find_apid(0x4c1, count);',
                        '\tPE_parse_boot_argn("sweetkeyspononly", &keys_pon_only, sizeof(keys_pon_only));\n'
                        '\tPE_parse_boot_argn("sweetvolup", &keys_volup_ppid, sizeof(keys_volup_ppid));\n'
                        '\tif (keys_volup_ppid > 0 && keys_volup_ppid < 0x1000) {\n'
                        '\t\tkeys_gpio_apid = keys_find_apid((uint16_t)keys_volup_ppid, count);\n'
-                       '\t\tprintf("SWEET KEYS: volume-up ppid=%#x apid=%u\\n", keys_volup_ppid, keys_gpio_apid);\n'
+                       '\t\tunsigned volup_delay = 150;\n'
+                       '\t\tPE_parse_boot_argn("sweetvolupdelay", &volup_delay, sizeof(volup_delay));\n'
+                       '\t\tclock_interval_to_deadline(volup_delay, NSEC_PER_SEC, &keys_volup_after);\n'
+                       '\t\tprintf("SWEET KEYS: volume-up ppid=%#x apid=%u polled after %u s\\n", keys_volup_ppid, keys_gpio_apid, volup_delay);\n'
                        '\t} else {\n'
                        '\t\tkeys_gpio_apid = keys_pon_only ? KEYS_NO_APID : keys_find_apid(0x4c1, count);\n'
                        '\t}')
-        text = replace(text, '\t\tif (!pok || !gok) {', '\t\tif (!pok || (!gok && keys_gpio_apid != KEYS_NO_APID)) {')
+        text = replace(text, '\t\tif (!pok || !gok) {', '\t\tif (!pok || (!gok && gapid != KEYS_NO_APID)) {')
     elif path == USB:
         text = replace(text, '\tprintf("SWEET USB: setup %02x %02x %04x %04x len %u\\n", type, req, value, index, length);', '''
 	// Keep handling each request; only suppress repeated filter trace lines.
