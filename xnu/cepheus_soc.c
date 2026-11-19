@@ -45,6 +45,9 @@ static struct osm_bank banks[] = {
 };
 struct osm_trial { bool active; unsigned old_index, new_index; };
 static struct osm_trial trials[4];
+/* cephboost=3: persistent thermal-gated performance mode (see cpu_interactive). */
+static uint32_t boost_cap_khz = 1401600;
+static unsigned boost_logs;
 static void osm_request(struct osm_bank *b, unsigned index)
 {
 	// clk-cpu-osm.c osm_set_index(): PERF_STATE_DESIRED then ENABLE read.
@@ -57,7 +60,7 @@ static void osm_trial_start(void)
 {
 	int enable = 0;
 	PE_parse_boot_argn("cephboost", &enable, sizeof(enable));
-	if (enable != 1 && enable != 2) { return; }
+	if (enable != 1 && enable != 2 && enable != 3) { return; }
 	for (unsigned n = 2; n < 4; ++n) {
 		struct osm_bank *b = &banks[n];
 		if (!b->enabled || sr(b->va, 0xbc) != 0) { continue; }
@@ -67,8 +70,21 @@ static void osm_trial_start(void)
 			freq[i] = sr(b->va, 0x110 + i * 32);
 			volt[i] = sr(b->va, 0x114 + i * 32);
 		}
-		unsigned target = cepheus_osm_same_voltage(freq, volt, CEPHEUS_OSM_ROWS, current);
+		unsigned target = enable == 3 ?
+		    cepheus_osm_capped(freq, volt, CEPHEUS_OSM_ROWS, current, boost_cap_khz) :
+		    cepheus_osm_same_voltage(freq, volt, CEPHEUS_OSM_ROWS, current);
 		if (target == current || sr(b->va, 0x920) != current) { continue; }
+		if (enable == 3) {
+			trials[n] = (struct osm_trial){true, current, target};
+			osm_request(b, target);
+			if (boost_logs++ < 8) {
+				printf("CEPHEUS OSM: boost %s %u/%u -> %u/%u mv=%u->%u readback=%u\n",
+				    b->name, current, cepheus_osm_khz(freq[current]), target,
+				    cepheus_osm_khz(freq[target]), volt[current] & 0xfffu,
+				    volt[target] & 0xfffu, sr(b->va, 0x920));
+			}
+			continue;
+		}
 		printf("CEPHEUS OSM: trial %s old=%u/%u new=%u/%u mv=%u old_corner=%u new_corner=%u duration=120s\n",
 		    b->name, current, cepheus_osm_khz(freq[current]), target, cepheus_osm_khz(freq[target]),
 		    volt[target] & 0xfffu, (volt[current] >> 16) & 63u, (volt[target] >> 16) & 63u);
@@ -102,21 +118,46 @@ static void osm_trial_restore(void)
 		unsigned current = sr(b->va, 0x920);
 		if (current == trials[n].new_index) {
 			osm_request(b, trials[n].old_index);
-			printf("CEPHEUS OSM: restored %s desired=%u\n", b->name, sr(b->va, 0x920));
+			if (boost_logs < 8) {
+				printf("CEPHEUS OSM: restored %s desired=%u\n", b->name, sr(b->va, 0x920));
+			}
 		} else {
 			printf("CEPHEUS OSM: %s external desired=%u; not overwriting another owner's request\n", b->name, current);
 		}
 		trials[n].active = false;
 	}
 }
-static void cpu_interactive(void)
+/* Same thermal hysteresis as ceph_cpu_should_raise (65C off, 55C re-entry,
+ * invalid or stale sensor fails closed), with a configurable linger after the
+ * last touch. linger_ns == 0 means raise whenever the sensor allows it. */
+static int policy_raise(int valid, int mc, int *hot, uint64_t now,
+    uint64_t last_activity, uint64_t sample_age_ns, uint64_t linger_ns)
 {
-	/* opt-in, max 30min per boot. No attempt to re-init TSENS or raise the
-	 * voltage; invalid sensor/ownership drops to the saved request. */
-	uint64_t until, previous = mach_absolute_time();
-	clock_interval_to_deadline(1800, NSEC_PER_SEC, &until);
+	if (!valid || mc >= 65000) { *hot = 1; return 0; }
+	if (*hot && mc < 55000) { *hot = 0; }
+	if (*hot || sample_age_ns > 1000000000ULL) { return 0; }
+	if (!linger_ns) { return 1; }
+	if (!last_activity || now < last_activity) { return 0; }
+	return now - last_activity < linger_ns;
+}
+static void cpu_interactive(int mode)
+{
+	/* mode 2: opt-in, max 30min per boot. mode 3: no expiry, LUT cap from
+	 * cephmaxkhz, linger from cephlinger (s, 0 = always while cool).
+	 * No attempt to re-init TSENS or write voltage; invalid sensor or
+	 * another owner's request drops to the saved baseline. */
+	uint64_t until = ~0ULL, previous = mach_absolute_time();
+	if (mode != 3) { clock_interval_to_deadline(1800, NSEC_PER_SEC, &until); }
+	unsigned linger_s = 3;
+	if (mode == 3) {
+		(void)PE_parse_boot_argn("cephmaxkhz", &boost_cap_khz, sizeof(boost_cap_khz));
+		(void)PE_parse_boot_argn("cephlinger", &linger_s, sizeof(linger_s));
+		printf("CEPHEUS CPU POLICY: performance mode cap=%u kHz linger=%u s (65C off, 55C on)\n",
+		    boost_cap_khz, linger_s);
+	}
+	uint64_t linger_ns = (uint64_t)linger_s * 1000000000ULL;
 	int hot = 1, last_raise = -1;
-	unsigned iterations = 0;
+	unsigned iterations = 0, changes = 0;
 	while (mach_absolute_time() < until) {
 		int mc = 0;
 		int valid = cpu_temperature(&mc);
@@ -125,11 +166,15 @@ static void cpu_interactive(void)
 		absolutetime_to_nanoseconds(__atomic_load_n(&activity_ticks, __ATOMIC_RELAXED), &act_ns);
 		absolutetime_to_nanoseconds(now - previous, &age_ns);
 		previous = now;
-		int raise = ceph_cpu_should_raise(valid, mc, &hot, now_ns, act_ns, age_ns);
-		if (raise != last_raise || (iterations++ % 40) == 0) {
+		int raise = mode == 3 ?
+		    policy_raise(valid, mc, &hot, now_ns, act_ns, age_ns, linger_ns) :
+		    ceph_cpu_should_raise(valid, mc, &hot, now_ns, act_ns, age_ns);
+		bool changed = raise != last_raise;
+		if (changed) { changes++; }
+		if ((changed && changes <= 40) || (iterations++ % 240) == 0) {
 			printf("CEPHEUS CPU POLICY: valid=%d max_mc=%d hot=%d raise=%d\n", valid, mc, hot, raise);
-			last_raise = raise;
 		}
+		last_raise = raise;
 		if (raise) {
 			bool active = false;
 			for (unsigned n = 2; n < 4; ++n) {
@@ -230,8 +275,12 @@ static void soc_thread(void *arg, wait_result_t wr)
 	swait(60000); // let SpringBoard reach UI before an optional timed experiment
 	int mode = 0;
 	PE_parse_boot_argn("cephboost", &mode, sizeof(mode));
+	if (mode == 3) {
+		cpu_interactive(3);
+		(void)thread_terminate(current_thread()); thread_block(THREAD_CONTINUE_NULL); return;
+	}
 	if (mode == 2) {
-		cpu_interactive();
+		cpu_interactive(2);
 		(void)thread_terminate(current_thread()); thread_block(THREAD_CONTINUE_NULL); return;
 	}
 	osm_trial_start();
