@@ -780,9 +780,17 @@ touch_thread(void *arg, wait_result_t result)
 	/* Vendor setScanMode(SCAN_MODE_ACTIVE, ACTIVE_MULTI_TOUCH). Not firmware
 	 * upload or flash erase. After reset the controller does not scan by default.
 	 */
-	const uint8_t scan[] = {0xa0, 0x00, 0x01};
+	/* sweettouchscan picks the active-scan bits. The ST FTM5 Linux driver
+	 * uses 0xff on screen-on ("enable all the possible scans mode supported
+	 * by the config"); 0x01 is mutual multi-touch only, which leaves
+	 * self-sense off and on cepheus is followed by SS force-cal events
+	 * (43 05 30/31) and a silent controller.
+	 */
+	unsigned scan_bits = 0x01;
+	(void)PE_parse_boot_argn("sweettouchscan", &scan_bits, sizeof(scan_bits));
+	const uint8_t scan[] = {0xa0, 0x00, (uint8_t)scan_bits};
 	int scan_error = touch_msg(TOUCH_I2C_ADDR, scan, sizeof(scan), NULL, 0, false);
-	printf("SWEET TOUCH (cepheus): active scan err=%d\n", scan_error);
+	printf("SWEET TOUCH (cepheus): active scan err=%d bits=%#x\n", scan_error, scan[2]);
 	if (scan_error) { goto out; }
 	printf("SWEET TOUCH (cepheus): selected ST-FTS, %dx%d, poll=10ms irq-hint=%d\n",
 	    TOUCH_X_MAX, TOUCH_Y_MAX, st.irq_hint);
