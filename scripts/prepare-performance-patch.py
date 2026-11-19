@@ -14,7 +14,9 @@ FB = 'iokit/Kernel/arm/SweetFramebuffer.cpp'
 HID = 'iokit/Kernel/arm/hid/SweetHID.cpp'
 KEYS = 'bsd/dev/sweet_keys.c'
 USB = 'bsd/dev/sweet_usb.c'
-PATHS = (FB, HID, KEYS, USB)
+SPMI = 'bsd/dev/sweet_spmi.c'
+BATT = 'iokit/Kernel/arm/SweetBattery.cpp'
+PATHS = (FB, HID, KEYS, USB, SPMI, BATT)
 
 FADE_BLOCK = '''	if (fb->fPowerOff) {
 		/* Fade out: halve every channel each vsync, then black, then idle. */
@@ -112,6 +114,138 @@ def transform(path, text):
                        '\t\tkeys_gpio_apid = keys_pon_only ? KEYS_NO_APID : keys_find_apid(0x4c1, count);\n'
                        '\t}')
         text = replace(text, '\t\tif (!pok || !gok) {', '\t\tif (!pok || (!gok && gapid != KEYS_NO_APID)) {')
+    elif path == SPMI:
+        # Mi 9 battery lives on PM8150B (SID 2): SMB5 charger blocks share
+        # the PM6150 layout; the gauge is FG gen4 (BATT_SOC 0x40, BATT_INFO
+        # 0x41) instead of QG 0x48. Still observer reads only.
+        text = replace(text, '''	if (!sp_ready || !out || sid != 0 || addr > 0xffffu ||
+	    (peripheral != 0x10 && peripheral != 0x11 && peripheral != 0x12 &&
+	    peripheral != 0x13 && peripheral != 0x48)) {''', '''	bool sweet_block = sid == 0 && (peripheral == 0x10 || peripheral == 0x11 ||
+	    peripheral == 0x12 || peripheral == 0x13 || peripheral == 0x48);
+	bool cepheus_block = sid == 2 && (peripheral == 0x10 || peripheral == 0x11 ||
+	    peripheral == 0x13 || peripheral == 0x40 || peripheral == 0x41);
+	if (!sp_ready || !out || addr > 0xffffu || (!sweet_block && !cepheus_block)) {''')
+    elif path == BATT:
+        text = replace(text, '\tvoid poll(void);',
+                       '\tvoid poll(void);\n\tvoid pollCepheus(void);\n'
+                       '\tint fMode;\n\tbool fArmed;\n\tUInt32 fDesign, fDelayMS;\n\tunsigned fLogs, fLastPercent;\n'
+                       '\tstatic bool readPair(unsigned a, unsigned b, uint16_t *value);')
+        text = replace(text, '\tfLastMode = -1;\n\treturn true;',
+                       '\tfLastMode = -1;\n\tfMode = 0;\n\tfArmed = false;\n\tfDesign = 5020;\n'
+                       '\tfDelayMS = 150000;\n\tfLogs = 0;\n\tfLastPercent = ~0u;\n\treturn true;')
+        text = replace(text, '(5020u * percent + 50u)', '(fDesign * percent + 50u)')
+        text = replace(text, '5020);', 'fDesign);', count=3)
+        text = replace(text, '{capacity, 5020,', '{capacity, fDesign,')
+        text = replace(text, '\tputBool("SweetBatterySOCEstimated", measured);',
+                       '\tputBool("SweetBatterySOCEstimated", measured && fMode != 2);')
+        text = replace(text, 'measured ? "PM6150 / estimated SOC" : "static fallback"',
+                       'measured ? (fMode == 2 ? "PM8150B FG gen4 SOC" : "PM6150 / estimated SOC") : "static fallback"')
+        text = replace(text, 'void\nSweetBattery::poll(void)\n{\n', '''/* FG gen4 keeps a copy (_CP) register next to each sample; Linux accepts a
+ * sample only when the pair matches. Same here, a few bounded tries. */
+bool
+SweetBattery::readPair(unsigned a, unsigned b, uint16_t *value)
+{
+	for (unsigned attempt = 0; attempt < 4; ++attempt) {
+		uint8_t lo, hi, clo, chi;
+		if (sweet_spmi_read(2, a, &lo) || sweet_spmi_read(2, a + 1, &hi) ||
+		    sweet_spmi_read(2, b, &clo) || sweet_spmi_read(2, b + 1, &chi)) {
+			return false;
+		}
+		if (lo == clo && hi == chi) {
+			*value = (uint16_t)((unsigned)lo | ((unsigned)hi << 8));
+			return true;
+		}
+	}
+	return false;
+}
+
+/* sweetbattery=2: Mi 9 PM8150B. MSOC/VBATT/IBATT decode follows Linux
+ * fg-util.c (fg_get_msoc, fg_get_battery_voltage/current); charger state
+ * uses the SMB5 registers of the reference path on SID 2. Read only.
+ * The first hardware read waits sweetbattdelay seconds (default 150), past
+ * touch calibration, like the volume-up poll. */
+void
+SweetBattery::pollCepheus(void)
+{
+	uint8_t soc = 0, socCopy = 1, usb, path, charger, error, temperature;
+	bool socOk = false;
+	if (!fArmed) {
+		publish(100, 4200, 0, true, true, false, true, false, false);
+		return;
+	}
+	for (unsigned attempt = 0; attempt < 4 && !socOk; ++attempt) {
+		if (sweet_spmi_read(2, 0x4009, &soc) || sweet_spmi_read(2, 0x400a, &socCopy)) {
+			break;
+		}
+		socOk = soc == socCopy;
+	}
+	bool valid = socOk &&
+	    !sweet_spmi_read(2, 0x1310, &usb) &&
+	    !sweet_spmi_read(2, 0x110b, &path) &&
+	    !sweet_spmi_read(2, 0x1006, &charger) &&
+	    !sweet_spmi_read(2, 0x1007, &error) &&
+	    !sweet_spmi_read(2, 0x100d, &temperature);
+	if (!valid) {
+		if (fLogs < 8) {
+			++fLogs;
+			IOLog("CEPHEUS BATTERY: read failed soc=%#x/%#x ok=%d\\n", soc, socCopy, socOk);
+		}
+		publish(100, 4200, 0, true, true, false, true, false, false);
+		return;
+	}
+	unsigned percent = soc == 255 ? 100u : soc == 0 ? 0u :
+	    ((unsigned)(soc - 1) * 98u + 126u) / 253u + 1u;
+	uint16_t rawVoltage = 0, rawCurrent = 0;
+	unsigned mv = readPair(0x41a0, 0x41a6, &rawVoltage) ?
+	    (unsigned)(((uint64_t)rawVoltage * 122070u) / 1000000u) : 0;
+	if (mv < 2800 || mv > 4600) {
+		mv = 3800; /* Display only; SOC comes from the gauge, not voltage. */
+	}
+	bool currentValid = readPair(0x41a2, 0x41a8, &rawCurrent);
+	int ma = 0;
+	if (currentValid) {
+		int signedRaw = (rawCurrent & 0x8000u) ? (int)rawCurrent - 65536 : (int)rawCurrent;
+		/* Linux: positive=discharging; IOPMPowerSource: positive=charging. */
+		ma = (int)(-((int64_t)signedRaw * 488281) / 1000000);
+	}
+	bool external = (usb & 0x10u) != 0;
+	bool capable = external && (path & 0x10u) && (path & 1u) && !(path & 0x40u);
+	unsigned state = charger & 7u;
+	bool charging = capable && state >= 1 && state <= 4 &&
+	    !(error & 2u) && !(temperature & 0x0cu);
+	bool full = external && state == 5 && !(error & 2u);
+	if (full) {
+		percent = 100;
+	}
+	if (percent != fLastPercent && fLogs < 64) {
+		++fLogs;
+		IOLog("CEPHEUS BATTERY: msoc=%#x %u%% %umV %dmA usb=%#x path=%#x chg=%#x err=%#x\\n",
+		    soc, percent, mv, ma, usb, path, charger, error);
+	}
+	fLastPercent = percent;
+	publish(percent, mv, ma, external, capable, charging, full, true, currentValid);
+}
+
+void
+SweetBattery::poll(void)
+{
+	if (fMode == 2) {
+		pollCepheus();
+		return;
+	}
+''')
+        text = replace(text, '\tif (self && self->fRunning) {\n\t\tself->poll();',
+                       '\tif (self && self->fRunning) {\n\t\tself->fArmed = true;\n\t\tself->poll();')
+        text = replace(text, '\tfReal = real == 1 && sweet_spmi_init() == 0;', '''	fMode = real;
+	if (real == 2) {
+		unsigned delaySecs = 150;
+		(void)PE_parse_boot_argn("sweetbattdelay", &delaySecs, sizeof(delaySecs));
+		fDelayMS = (delaySecs > 3600 ? 3600 : (delaySecs ? delaySecs : 1)) * 1000;
+		fDesign = 3300; /* Mi 9 nominal cell */
+	}
+	fReal = (real == 1 || real == 2) && sweet_spmi_init() == 0;''')
+        text = replace(text, '\t\t\tfTimer->setTimeoutMS(30000);',
+                       '\t\t\tfTimer->setTimeoutMS(fMode == 2 ? fDelayMS : 30000);')
     elif path == USB:
         text = replace(text, '\tprintf("SWEET USB: setup %02x %02x %04x %04x len %u\\n", type, req, value, index, length);', '''
 	// Keep handling each request; only suppress repeated filter trace lines.
