@@ -17,7 +17,13 @@ int main(void)
 	uint32_t volt[] = {0x10002f4, 0x10102f4, 0x10202f4, 0x20302f4, 0x20402f4, 0x20502f4, 0x20602f4, 0x20702fc};
 	/* Real measured Gold rows: corner changes, open-loop mV remains 756. */
 	assert(cepheus_osm_same_voltage(freq, volt, 8, 0) == 6);
+	/* Capped performance pick: voltage may differ, OSM owns it. */
+	assert(cepheus_osm_capped(freq, volt, 8, 0, 1401600) == 6);
+	assert(cepheus_osm_capped(freq, volt, 8, 0, 2000000) == 7);
+	assert(cepheus_osm_capped(freq, volt, 8, 0, 300000) == 0);
+	assert(cepheus_osm_capped(freq, volt, 8, 7, 1401600) == 7); // never lower
 	freq[6] = 0x40010649; // single-core boost
+	assert(cepheus_osm_capped(freq, volt, 8, 0, 1401600) == 5);
 	assert(cepheus_osm_same_voltage(freq, volt, 8, 0) == 5);
 	freq[3] = 0xffffffffu;
 	assert(cepheus_osm_same_voltage(freq, volt, 8, 0) == 0);
