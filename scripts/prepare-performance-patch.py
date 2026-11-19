@@ -89,11 +89,19 @@ def transform(path, text):
     elif path == KEYS:
         # The reference SID4 GPIO2 is not Mi 9's volume-up. Do not emit its
         # permanently-down event or read it in the performance control.
-        text = replace(text, 'static bool keys_started;', 'static bool keys_started;\nstatic int keys_pon_only;')
+        # sweetvolup=PPID selects the board's volume-up PMIC GPIO peripheral
+        # (PPID = SID << 8 | GPIO base >> 8, read-only like the reference).
+        text = replace(text, 'static bool keys_started;', 'static bool keys_started;\nstatic int keys_pon_only;\nstatic int keys_volup_ppid;')
         text = replace(text, '\tkeys_gpio_apid = keys_find_apid(0x4c1, count);',
                        '\tPE_parse_boot_argn("sweetkeyspononly", &keys_pon_only, sizeof(keys_pon_only));\n'
-                       '\tkeys_gpio_apid = keys_pon_only ? KEYS_NO_APID : keys_find_apid(0x4c1, count);')
-        text = replace(text, '\t\tif (!pok || !gok) {', '\t\tif (!pok || (!gok && !keys_pon_only)) {')
+                       '\tPE_parse_boot_argn("sweetvolup", &keys_volup_ppid, sizeof(keys_volup_ppid));\n'
+                       '\tif (keys_volup_ppid > 0 && keys_volup_ppid < 0x1000) {\n'
+                       '\t\tkeys_gpio_apid = keys_find_apid((uint16_t)keys_volup_ppid, count);\n'
+                       '\t\tprintf("SWEET KEYS: volume-up ppid=%#x apid=%u\\n", keys_volup_ppid, keys_gpio_apid);\n'
+                       '\t} else {\n'
+                       '\t\tkeys_gpio_apid = keys_pon_only ? KEYS_NO_APID : keys_find_apid(0x4c1, count);\n'
+                       '\t}')
+        text = replace(text, '\t\tif (!pok || !gok) {', '\t\tif (!pok || (!gok && keys_gpio_apid != KEYS_NO_APID)) {')
     elif path == USB:
         text = replace(text, '\tprintf("SWEET USB: setup %02x %02x %04x %04x len %u\\n", type, req, value, index, length);', '''
 	// Keep handling each request; only suppress repeated filter trace lines.
