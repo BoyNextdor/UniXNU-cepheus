@@ -137,8 +137,8 @@ static struct {
 	uint32_t irq_status, active;
 	int x[TOUCH_MAX], y[TOUCH_MAX];
 	/* Controller reset/error seen: scanning must be re-enabled. */
-	bool rearm;
-	uint32_t reads, events, other, rearms;
+	bool rearm, ghost;
+	uint32_t reads, events, other, rearms, resets;
 } st;
 static int touch_sleep_chan;
 static struct cepheus_bb touch_bb;
@@ -535,6 +535,26 @@ touch_fts(void)
 		}
 		if (cepheus_fts_event(&frame, e)) { return EIO; }
 	}
+	/* Bad-baseline ghost frame (seen after a self-calibration on cepheus):
+	 * three or more contacts on the same sensor row (within 4 rows). Real
+	 * fingers practically never line up like that. Drop it and ask the
+	 * thread to hardware-reset the IC so it recalibrates.
+	 */
+	unsigned row_max = 0;
+	for (unsigned i = 0; i < TOUCH_MAX; ++i) {
+		if (!(frame.active & (1u << i))) { continue; }
+		unsigned row = 0;
+		for (unsigned j = 0; j < TOUCH_MAX; ++j) {
+			int dy = frame.y[j] - frame.y[i];
+			if ((frame.active & (1u << j)) && dy >= -4 && dy <= 4) { row++; }
+		}
+		if (row > row_max) { row_max = row; }
+	}
+	if (row_max >= 3) {
+		st.ghost = true;
+		touch_report(0, st.x, st.y);
+		return 0;
+	}
 	touch_report(frame.active, frame.x, frame.y);
 	return 0;
 }
@@ -775,6 +795,22 @@ touch_thread(void *arg, wait_result_t result)
 	(void)PE_parse_boot_argn("sweettouchrearm", &rearm_s, sizeof(rearm_s));
 	while (!st.dead) {
 		uint32_t seen = st.events;
+		if (st.ghost) {
+			st.ghost = false;
+			if (st.resets < 6) {
+				/* Same RESET pulse as sweettouchreset (active low), then
+				 * the controller-ready event re-arms scanning; re-arm
+				 * anyway in case that event is lost.
+				 */
+				st.resets++;
+				printf("SWEET TOUCH (cepheus): ghost row frame; IC reset %u\n", st.resets);
+				touch_gpio(TOUCH_PIN_RESET, 0, 3, 3, true, false);
+				touch_wait(10);
+				touch_gpio(TOUCH_PIN_RESET, 0, 3, 3, true, true);
+				touch_wait(300);
+				st.rearm = true;
+			}
+		}
 		if (st.rearm || (rearm_s && !st.active && idle >= rearm_s * 100u)) {
 			bool reset = st.rearm;
 			st.rearm = false;
@@ -811,8 +847,8 @@ touch_thread(void *arg, wait_result_t result)
 		idle = st.events != seen ? 0 : idle + 1;
 		if (++beat >= 3000u) {
 			beat = 0;
-			printf("SWEET TOUCH (cepheus): alive reads=%u events=%u other=%u rearms=%u active=%#x irq=%#x\n",
-			    st.reads, st.events, st.other, st.rearms, st.active,
+			printf("SWEET TOUCH (cepheus): alive reads=%u events=%u other=%u rearms=%u resets=%u active=%#x irq=%#x\n",
+			    st.reads, st.events, st.other, st.rearms, st.resets, st.active,
 			    touch_rd(st.south, TOUCH_GPIO_IO(TOUCH_PIN_IRQ)));
 		}
 		touch_wait(10);
